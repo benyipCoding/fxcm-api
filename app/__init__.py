@@ -1,0 +1,1 @@
+"""FXCM sidecar package."""
