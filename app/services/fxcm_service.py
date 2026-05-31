@@ -1,6 +1,9 @@
 import logging
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from threading import Lock
+from time import monotonic
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import pandas as pd
@@ -26,6 +29,36 @@ class FXCMServiceError(Exception):
         self.payload = payload
 
 
+@dataclass
+class _TTLCacheEntry:
+    expires_at: float
+    value: Any
+
+
+class _TTLCache:
+    def __init__(self) -> None:
+        self._entries: Dict[Tuple[Any, ...], _TTLCacheEntry] = {}
+        self._lock = Lock()
+
+    def get(self, key: Tuple[Any, ...]) -> Optional[Any]:
+        now = monotonic()
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return None
+            if entry.expires_at <= now:
+                self._entries.pop(key, None)
+                return None
+            return deepcopy(entry.value)
+
+    def set(self, key: Tuple[Any, ...], value: Any, *, ttl_seconds: int) -> None:
+        with self._lock:
+            self._entries[key] = _TTLCacheEntry(
+                expires_at=monotonic() + ttl_seconds,
+                value=deepcopy(value),
+            )
+
+
 @dataclass(frozen=True)
 class IntervalSpec:
     provider_interval: str
@@ -42,6 +75,10 @@ class OfferMetadata:
 
 
 class FXCMHistoryService:
+    SUPPORTED_MARKETS = {"stocks", "etf", "mutual_funds", "forex", "crypto"}
+    LOGIN_MAX_ATTEMPTS = 2
+    BATCH_QUOTES_CACHE_TTL_SECONDS = 8
+    MARKET_SYMBOLS_CACHE_TTL_SECONDS = 20
     INTERVAL_SPECS = {
         "1min": IntervalSpec(provider_interval="m1", bucket_seconds=60),
         "5min": IntervalSpec(provider_interval="m5", bucket_seconds=300),
@@ -114,6 +151,7 @@ class FXCMHistoryService:
 
     def __init__(self) -> None:
         self.settings = get_settings()
+        self._response_cache = _TTLCache()
 
     def fetch_history(
         self,
@@ -179,17 +217,11 @@ class FXCMHistoryService:
             )
 
         with ForexConnect() as fx:
-            fx.login(
-                self.settings.username,
-                self.settings.password,
-                self.settings.url,
-                self.settings.connection,
-                self.settings.session_id,
-                self.settings.pin,
-                self._on_session_status_changed,
-            )
-            offers = list(self._iter_offers(fx))
-            fx.logout()
+            self._login(fx)
+            try:
+                offers = list(self._iter_offers(fx))
+            finally:
+                self._logout(fx)
 
         exact_matches: List[Dict[str, Any]] = []
         fuzzy_matches: List[Dict[str, Any]] = []
@@ -225,6 +257,169 @@ class FXCMHistoryService:
             "items": deduped,
         }
 
+    def fetch_quote(
+        self,
+        *,
+        symbol: str,
+        interval: str = "1day",
+        price_type: str = "mid",
+    ) -> Dict[str, Any]:
+        requested_interval = self._resolve_interval_name(interval)
+        normalized_price_type = self._normalize_price_type(price_type)
+
+        with ForexConnect() as fx:
+            self._login(fx)
+            try:
+                return self._build_quote_payload(
+                    fx,
+                    symbol=symbol,
+                    requested_interval=requested_interval,
+                    price_type=normalized_price_type,
+                )
+            finally:
+                self._logout(fx)
+
+    def fetch_quotes_batch(
+        self,
+        *,
+        symbols: Sequence[str],
+        interval: str = "1day",
+        price_type: str = "mid",
+    ) -> Dict[str, Any]:
+        requested_symbols = [item.strip() for item in symbols if item and item.strip()]
+        if not requested_symbols:
+            raise FXCMServiceError(
+                status_code=400,
+                message="At least one symbol is required",
+                payload={"field": "symbols"},
+            )
+
+        requested_interval = self._resolve_interval_name(interval)
+        normalized_price_type = self._normalize_price_type(price_type)
+        cache_key = (
+            "quotes_batch",
+            tuple(requested_symbols),
+            requested_interval,
+            normalized_price_type,
+        )
+        cached = self._response_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        with ForexConnect() as fx:
+            self._login(fx)
+            try:
+                offers_by_lookup = self._index_offers_by_lookup(self._iter_offers(fx))
+                items: List[Dict[str, Any]] = []
+                errors: List[Dict[str, Any]] = []
+
+                for requested_symbol in requested_symbols:
+                    try:
+                        quote = self._build_quote_payload(
+                            fx,
+                            symbol=requested_symbol,
+                            requested_interval=requested_interval,
+                            price_type=normalized_price_type,
+                            offer=offers_by_lookup.get(
+                                self._normalize_lookup(requested_symbol)
+                            ),
+                        )
+                    except FXCMServiceError as exc:
+                        errors.append(
+                            {
+                                "requested_symbol": requested_symbol,
+                                "code": exc.status_code,
+                                "message": exc.message,
+                                "data": exc.payload,
+                            }
+                        )
+                        continue
+
+                    items.append({"requested_symbol": requested_symbol, **quote})
+            finally:
+                self._logout(fx)
+
+        response = {
+            "requested_symbols": requested_symbols,
+            "count": len(requested_symbols),
+            "succeeded": len(items),
+            "failed": len(errors),
+            "items": items,
+            "errors": errors,
+        }
+        self._response_cache.set(
+            cache_key,
+            response,
+            ttl_seconds=self.BATCH_QUOTES_CACHE_TTL_SECONDS,
+        )
+        return response
+
+    def list_instruments_by_market(
+        self,
+        *,
+        market: str,
+        outputsize: int = 50,
+        country: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        normalized_market = market.strip().casefold()
+        if normalized_market not in self.SUPPORTED_MARKETS:
+            raise FXCMServiceError(
+                status_code=400,
+                message="Unsupported market",
+                payload={
+                    "market": market,
+                    "supported": sorted(self.SUPPORTED_MARKETS),
+                },
+            )
+
+        cache_key = (
+            "market_symbols",
+            normalized_market,
+            outputsize,
+            self._normalize_lookup(country),
+        )
+        cached = self._response_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        if normalized_market in {"etf", "mutual_funds"}:
+            response = {"market": normalized_market, "count": 0, "items": []}
+            self._response_cache.set(
+                cache_key,
+                response,
+                ttl_seconds=self.MARKET_SYMBOLS_CACHE_TTL_SECONDS,
+            )
+            return response
+
+        with ForexConnect() as fx:
+            self._login(fx)
+            try:
+                items = [
+                    self._build_search_item(offer)
+                    for offer in self._iter_offers(fx)
+                    if self._matches_market_key(offer, normalized_market)
+                ]
+            finally:
+                self._logout(fx)
+
+        if country is not None:
+            items = [
+                item for item in items if self._matches_country_filter(item, country)
+            ]
+
+        items = self._sort_search_items(items)[:outputsize]
+        response = {
+            "market": normalized_market,
+            "count": len(items),
+            "items": items,
+        }
+        self._response_cache.set(
+            cache_key,
+            response,
+            ttl_seconds=self.MARKET_SYMBOLS_CACHE_TTL_SECONDS,
+        )
+        return response
+
     def _request_history(
         self,
         *,
@@ -235,27 +430,122 @@ class FXCMHistoryService:
         quotes_count: int,
     ) -> Tuple[Any, Any]:
         with ForexConnect() as fx:
-            fx.login(
-                self.settings.username,
-                self.settings.password,
-                self.settings.url,
-                self.settings.connection,
-                self.settings.session_id,
-                self.settings.pin,
-                self._on_session_status_changed,
-            )
-            offer = self._find_offer(fx, symbol)
+            self._login(fx)
+            try:
+                offer = self._find_offer(fx, symbol)
+                provider_symbol = getattr(offer, "instrument", None) or symbol
+                history = self._get_history_or_raise(
+                    fx,
+                    instrument=provider_symbol,
+                    timeframe=provider_interval,
+                    start_date=start_date,
+                    end_date=end_date,
+                    quotes_count=quotes_count,
+                )
+                return history, offer
+            finally:
+                self._logout(fx)
 
-            history = self._get_history_or_raise(
-                fx,
-                instrument=symbol,
-                timeframe=provider_interval,
-                start_date=start_date,
-                end_date=end_date,
-                quotes_count=quotes_count,
+    def _build_quote_payload(
+        self,
+        fx: ForexConnect,
+        *,
+        symbol: str,
+        requested_interval: str,
+        price_type: str,
+        offer: Any = None,
+    ) -> Dict[str, Any]:
+        interval_spec = self._get_interval_spec(requested_interval)
+        raw_quotes_count = max(2, self._resolve_quotes_count(requested_interval, 2))
+        resolved_offer = offer or self._find_offer(fx, symbol)
+        if resolved_offer is None:
+            raise FXCMServiceError(
+                status_code=404,
+                message="FXCM instrument not found",
+                payload={"symbol": symbol},
             )
-            fx.logout()
-            return history, offer
+
+        provider_symbol = getattr(resolved_offer, "instrument", None) or symbol
+        raw_history = self._get_history_or_raise(
+            fx,
+            instrument=provider_symbol,
+            timeframe=interval_spec.provider_interval,
+            start_date=None,
+            end_date=None,
+            quotes_count=raw_quotes_count,
+        )
+
+        rows = self._normalize_history_rows(raw_history)
+        rows = self._aggregate_rows(rows, requested_interval)
+        price_rows = [self._select_prices(row, price_type) for row in rows]
+        latest_row = price_rows[-1] if price_rows else {}
+        previous_row = price_rows[-2] if len(price_rows) >= 2 else {}
+
+        current_price = self._resolve_price(
+            price_type,
+            self._to_float(getattr(resolved_offer, "bid", None)),
+            self._to_float(getattr(resolved_offer, "ask", None)),
+        )
+        if current_price is None:
+            current_price = self._to_float(latest_row.get("close"))
+
+        current_timestamp = self._to_offer_timestamp(
+            getattr(resolved_offer, "time", None)
+        )
+        if current_timestamp is None:
+            current_timestamp = self._to_int(latest_row.get("timestamp"))
+
+        quote_datetime = (
+            self._format_datetime(current_timestamp)
+            if current_timestamp is not None
+            else latest_row.get("datetime")
+        )
+        previous_close = self._to_float(previous_row.get("close"))
+        change_value = None
+        percent_change = None
+        if current_price is not None and previous_close not in (None, 0):
+            change_value = current_price - previous_close
+            percent_change = (change_value / previous_close) * 100.0
+
+        latest_open = self._to_float(latest_row.get("open"))
+        latest_high = self._to_float(latest_row.get("high"))
+        latest_low = self._to_float(latest_row.get("low"))
+        if current_price is not None:
+            if latest_open is None:
+                latest_open = current_price
+            if latest_high is None or current_price > latest_high:
+                latest_high = current_price
+            if latest_low is None or current_price < latest_low:
+                latest_low = current_price
+
+        offer_meta = self._build_offer_metadata(resolved_offer)
+
+        return {
+            "symbol": provider_symbol,
+            "provider_symbol": provider_symbol,
+            "name": provider_symbol,
+            "exchange": offer_meta.exchange,
+            "mic_code": None,
+            "currency": getattr(resolved_offer, "contract_currency", None),
+            "datetime": quote_datetime,
+            "timestamp": current_timestamp,
+            "last_quote_at": current_timestamp,
+            "open": latest_open,
+            "high": latest_high,
+            "low": latest_low,
+            "close": current_price,
+            "change": change_value,
+            "percent_change": percent_change,
+            "previous_close": previous_close,
+            "volume": self._to_int(latest_row.get("volume")),
+            "average_volume": None,
+            "is_market_open": self._is_market_open(resolved_offer),
+            "fifty_two_week": {
+                "low": None,
+                "high": None,
+                "range": None,
+            },
+        }
 
     def _get_history_or_raise(
         self,
@@ -338,6 +628,17 @@ class FXCMHistoryService:
             if self._normalize_lookup(instrument) == normalized_symbol:
                 return offer
         return None
+
+    def _index_offers_by_lookup(
+        self,
+        offers: Sequence[Any],
+    ) -> Dict[str, Any]:
+        indexed: Dict[str, Any] = {}
+        for offer in offers:
+            key = self._normalize_lookup(getattr(offer, "instrument", None))
+            if key and key not in indexed:
+                indexed[key] = offer
+        return indexed
 
     def _aggregate_rows(
         self,
@@ -609,6 +910,103 @@ class FXCMHistoryService:
             ),
         )
 
+    def _matches_market_key(self, offer: Any, market: str) -> bool:
+        offer_meta = self._build_offer_metadata(offer)
+        market_value = self._normalize_lookup(offer_meta.market)
+        asset_type_value = self._normalize_lookup(offer_meta.asset_type)
+
+        if market == "forex":
+            return market_value == self._normalize_lookup("Forex")
+        if market == "crypto":
+            return market_value == self._normalize_lookup("Crypto")
+        if market == "stocks":
+            return asset_type_value == self._normalize_lookup("Common Stock")
+        if market == "etf":
+            return asset_type_value == self._normalize_lookup("ETF")
+        if market == "mutual_funds":
+            return asset_type_value == self._normalize_lookup("Mutual Fund")
+        return False
+
+    def _matches_country_filter(
+        self,
+        item: Mapping[str, Any],
+        country: str,
+    ) -> bool:
+        normalized_country = self._normalize_lookup(country)
+        if not normalized_country:
+            return True
+
+        candidates = [
+            item.get("country"),
+            item.get("exchange"),
+            item.get("provider_symbol"),
+        ]
+        return any(
+            normalized_country in self._normalize_lookup(candidate)
+            or self._normalize_lookup(candidate) in normalized_country
+            for candidate in candidates
+            if candidate not in (None, "")
+        )
+
+    def _login(self, fx: ForexConnect) -> None:
+        last_exception = None
+
+        for attempt in range(1, self.LOGIN_MAX_ATTEMPTS + 1):
+            try:
+                fx.login(
+                    self.settings.username,
+                    self.settings.password,
+                    self.settings.url,
+                    self.settings.connection,
+                    self.settings.session_id,
+                    self.settings.pin,
+                    self._on_session_status_changed,
+                )
+                return
+            except Exception as exc:
+                last_exception = exc
+                error_text = str(exc)
+                if "Wait timeout exceeded" in error_text:
+                    logger.warning(
+                        "FXCM login attempt timed out",
+                        extra={
+                            "attempt": attempt,
+                            "max_attempts": self.LOGIN_MAX_ATTEMPTS,
+                        },
+                    )
+                    if attempt < self.LOGIN_MAX_ATTEMPTS:
+                        continue
+                    raise FXCMServiceError(
+                        status_code=504,
+                        message="FXCM login timed out",
+                        payload={
+                            "detail": error_text,
+                            "attempts": self.LOGIN_MAX_ATTEMPTS,
+                        },
+                    ) from exc
+
+                raise FXCMServiceError(
+                    status_code=502,
+                    message="FXCM login failed",
+                    payload={"detail": error_text},
+                ) from exc
+
+        if last_exception is not None:
+            raise FXCMServiceError(
+                status_code=504,
+                message="FXCM login timed out",
+                payload={
+                    "detail": str(last_exception),
+                    "attempts": self.LOGIN_MAX_ATTEMPTS,
+                },
+            ) from last_exception
+
+    def _logout(self, fx: ForexConnect) -> None:
+        try:
+            fx.logout()
+        except Exception:
+            logger.warning("FXCM logout failed", exc_info=True)
+
     def _max_value(
         self,
         rows: Sequence[Mapping[str, Any]],
@@ -647,6 +1045,23 @@ class FXCMHistoryService:
 
     def _format_datetime(self, timestamp: int) -> str:
         return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+
+    def _to_offer_timestamp(self, value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            ts = pd.Timestamp(value)
+        except Exception:
+            return None
+
+        if ts.tz is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        return int(ts.timestamp())
+
+    def _is_market_open(self, offer: Any) -> bool:
+        return getattr(offer, "trading_status", None) == "O"
 
     def _normalize_lookup(self, value: Any) -> str:
         if value in (None, ""):

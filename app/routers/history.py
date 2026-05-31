@@ -3,7 +3,14 @@ from typing import Optional
 from fastapi import APIRouter, Query
 from starlette.concurrency import run_in_threadpool
 
-from app.schemas.history import HealthResponse, HistoryResponse, SymbolSearchResponse
+from app.schemas.history import (
+    BatchQuoteResponse,
+    HealthResponse,
+    HistoryResponse,
+    MarketSymbolsResponse,
+    QuoteResponse,
+    SymbolSearchResponse,
+)
 from app.services.fxcm_service import fxcm_history_service
 
 
@@ -55,6 +62,60 @@ async def get_history(
 
 
 @router.get(
+    "/quote",
+    response_model=QuoteResponse,
+    summary="Fetch a latest FXCM quote snapshot",
+)
+async def get_quote(
+    symbol: str = Query(..., description="Instrument symbol, for example EUR/USD."),
+    interval: str = Query(
+        "1day",
+        description="Reference interval used to derive OHLC and previous close.",
+    ),
+    price_type: str = Query(
+        "mid",
+        regex="^(bid|ask|mid)$",
+        description="Which quote side should be surfaced as close/open/high/low.",
+    ),
+) -> QuoteResponse:
+    return await run_in_threadpool(
+        fxcm_history_service.fetch_quote,
+        symbol=symbol,
+        interval=interval,
+        price_type=price_type,
+    )
+
+
+@router.get(
+    "/quotes/batch",
+    response_model=BatchQuoteResponse,
+    summary="Fetch latest FXCM quote snapshots in a single session",
+)
+async def get_quotes_batch(
+    symbols: str = Query(
+        ...,
+        description="Comma-separated instrument symbols, for example EUR/USD,XAU/USD.",
+    ),
+    interval: str = Query(
+        "1day",
+        description="Reference interval used to derive OHLC and previous close.",
+    ),
+    price_type: str = Query(
+        "mid",
+        regex="^(bid|ask|mid)$",
+        description="Which quote side should be surfaced as close/open/high/low.",
+    ),
+) -> BatchQuoteResponse:
+    requested_symbols = [item.strip() for item in symbols.split(",")]
+    return await run_in_threadpool(
+        fxcm_history_service.fetch_quotes_batch,
+        symbols=requested_symbols,
+        interval=interval,
+        price_type=price_type,
+    )
+
+
+@router.get(
     "/symbols/search",
     response_model=SymbolSearchResponse,
     summary="Search FXCM instruments",
@@ -67,4 +128,29 @@ async def search_symbols(
         fxcm_history_service.search_instruments,
         keyword=keyword,
         outputsize=outputsize,
+    )
+
+
+@router.get(
+    "/symbols/market",
+    response_model=MarketSymbolsResponse,
+    summary="List FXCM instruments for a market bucket",
+)
+async def list_symbols_by_market(
+    market: str = Query(
+        ...,
+        regex="^(stocks|etf|mutual_funds|forex|crypto)$",
+        description="Internal market bucket used by the main backend.",
+    ),
+    outputsize: int = Query(50, ge=1, le=200),
+    country: Optional[str] = Query(
+        None,
+        description="Optional country filter, mainly useful for stock CFDs.",
+    ),
+) -> MarketSymbolsResponse:
+    return await run_in_threadpool(
+        fxcm_history_service.list_instruments_by_market,
+        market=market,
+        outputsize=outputsize,
+        country=country,
     )
