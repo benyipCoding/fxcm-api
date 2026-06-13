@@ -152,6 +152,23 @@ class FXCMHistoryService:
     def __init__(self) -> None:
         self.settings = get_settings()
         self._response_cache = _TTLCache()
+        self._fx = ForexConnect()
+        self._connection_lock = Lock()
+
+    def _ensure_connected(self) -> ForexConnect:
+        with self._connection_lock:
+            try:
+                # 若底层引擎已断开，会返回 False
+                connected = self._fx.is_connected()
+            except Exception:
+                connected = False
+
+            if not connected:
+                logger.info(
+                    "FXCM session is disconnected or not initialized. Initiating login..."
+                )
+                self._login(self._fx)
+            return self._fx
 
     def fetch_history(
         self,
@@ -216,12 +233,8 @@ class FXCMHistoryService:
                 payload={"field": "keyword"},
             )
 
-        with ForexConnect() as fx:
-            self._login(fx)
-            try:
-                offers = list(self._iter_offers(fx))
-            finally:
-                self._logout(fx)
+        fx = self._ensure_connected()
+        offers = list(self._iter_offers(fx))
 
         exact_matches: List[Dict[str, Any]] = []
         fuzzy_matches: List[Dict[str, Any]] = []
@@ -267,17 +280,13 @@ class FXCMHistoryService:
         requested_interval = self._resolve_interval_name(interval)
         normalized_price_type = self._normalize_price_type(price_type)
 
-        with ForexConnect() as fx:
-            self._login(fx)
-            try:
-                return self._build_quote_payload(
-                    fx,
-                    symbol=symbol,
-                    requested_interval=requested_interval,
-                    price_type=normalized_price_type,
-                )
-            finally:
-                self._logout(fx)
+        fx = self._ensure_connected()
+        return self._build_quote_payload(
+            fx,
+            symbol=symbol,
+            requested_interval=requested_interval,
+            price_type=normalized_price_type,
+        )
 
     def fetch_quotes_batch(
         self,
@@ -306,38 +315,34 @@ class FXCMHistoryService:
         if cached is not None:
             return cached
 
-        with ForexConnect() as fx:
-            self._login(fx)
+        fx = self._ensure_connected()
+        offers_by_lookup = self._index_offers_by_lookup(self._iter_offers(fx))
+        items: List[Dict[str, Any]] = []
+        errors: List[Dict[str, Any]] = []
+
+        for requested_symbol in requested_symbols:
             try:
-                offers_by_lookup = self._index_offers_by_lookup(self._iter_offers(fx))
-                items: List[Dict[str, Any]] = []
-                errors: List[Dict[str, Any]] = []
+                quote = self._build_quote_payload(
+                    fx,
+                    symbol=requested_symbol,
+                    requested_interval=requested_interval,
+                    price_type=normalized_price_type,
+                    offer=offers_by_lookup.get(
+                        self._normalize_lookup(requested_symbol)
+                    ),
+                )
+            except FXCMServiceError as exc:
+                errors.append(
+                    {
+                        "requested_symbol": requested_symbol,
+                        "code": exc.status_code,
+                        "message": exc.message,
+                        "data": exc.payload,
+                    }
+                )
+                continue
 
-                for requested_symbol in requested_symbols:
-                    try:
-                        quote = self._build_quote_payload(
-                            fx,
-                            symbol=requested_symbol,
-                            requested_interval=requested_interval,
-                            price_type=normalized_price_type,
-                            offer=offers_by_lookup.get(
-                                self._normalize_lookup(requested_symbol)
-                            ),
-                        )
-                    except FXCMServiceError as exc:
-                        errors.append(
-                            {
-                                "requested_symbol": requested_symbol,
-                                "code": exc.status_code,
-                                "message": exc.message,
-                                "data": exc.payload,
-                            }
-                        )
-                        continue
-
-                    items.append({"requested_symbol": requested_symbol, **quote})
-            finally:
-                self._logout(fx)
+            items.append({"requested_symbol": requested_symbol, **quote})
 
         response = {
             "requested_symbols": requested_symbols,
@@ -391,16 +396,12 @@ class FXCMHistoryService:
             )
             return response
 
-        with ForexConnect() as fx:
-            self._login(fx)
-            try:
-                items = [
-                    self._build_search_item(offer)
-                    for offer in self._iter_offers(fx)
-                    if self._matches_market_key(offer, normalized_market)
-                ]
-            finally:
-                self._logout(fx)
+        fx = self._ensure_connected()
+        items = [
+            self._build_search_item(offer)
+            for offer in self._iter_offers(fx)
+            if self._matches_market_key(offer, normalized_market)
+        ]
 
         if country is not None:
             items = [
@@ -429,22 +430,18 @@ class FXCMHistoryService:
         end_date: Optional[datetime],
         quotes_count: int,
     ) -> Tuple[Any, Any]:
-        with ForexConnect() as fx:
-            self._login(fx)
-            try:
-                offer = self._find_offer(fx, symbol)
-                provider_symbol = getattr(offer, "instrument", None) or symbol
-                history = self._get_history_or_raise(
-                    fx,
-                    instrument=provider_symbol,
-                    timeframe=provider_interval,
-                    start_date=start_date,
-                    end_date=end_date,
-                    quotes_count=quotes_count,
-                )
-                return history, offer
-            finally:
-                self._logout(fx)
+        fx = self._ensure_connected()
+        offer = self._find_offer(fx, symbol)
+        provider_symbol = getattr(offer, "instrument", None) or symbol
+        history = self._get_history_or_raise(
+            fx,
+            instrument=provider_symbol,
+            timeframe=provider_interval,
+            start_date=start_date,
+            end_date=end_date,
+            quotes_count=quotes_count,
+        )
+        return history, offer
 
     def _build_quote_payload(
         self,
@@ -1094,6 +1091,18 @@ class FXCMHistoryService:
 
     def _on_session_status_changed(self, session: Any, status: Any) -> None:
         logger.info("FXCM session status: %s", status)
+        # 0 = Disconnected
+        if status == 0:
+            with self._connection_lock:
+                try:
+                    logger.info(
+                        "FXCM session disconnected. Re-initializing ForexConnect..."
+                    )
+                    self._fx = ForexConnect()
+                except Exception as exc:
+                    logger.warning(
+                        f"Failed to cleanly recreate ForexConnect instance: {exc}"
+                    )
 
 
 fxcm_history_service = FXCMHistoryService()
