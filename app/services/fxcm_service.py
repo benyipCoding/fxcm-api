@@ -1,7 +1,7 @@
 import logging
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from threading import Lock
 from time import monotonic
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
@@ -1041,7 +1041,9 @@ class FXCMHistoryService:
         return sum(values) if values else None
 
     def _format_datetime(self, timestamp: int) -> str:
-        return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+        # Windows cannot convert pre-epoch timestamps via fromtimestamp().
+        epoch_utc = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        return (epoch_utc + timedelta(seconds=timestamp)).isoformat()
 
     def _to_offer_timestamp(self, value: Any) -> Optional[int]:
         if value is None:
@@ -1069,6 +1071,9 @@ class FXCMHistoryService:
         try:
             ts = pd.Timestamp(value)
         except Exception:
+            return None
+
+        if pd.isna(ts):
             return None
 
         if ts.tz is None:
