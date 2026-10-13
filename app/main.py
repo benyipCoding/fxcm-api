@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse
 
 from app.routers.history import router as history_router
 from app.routers.realtime import router as realtime_router
+from app.routers.trading import router as trading_router
 from app.services.realtime import realtime_hub
 from app.services.fxcm_service import FXCMServiceError
 
@@ -31,6 +32,7 @@ async def handle_fxcm_service_error(
 
 app.include_router(history_router)
 app.include_router(realtime_router)
+app.include_router(trading_router)
 
 
 @app.on_event("shutdown")
