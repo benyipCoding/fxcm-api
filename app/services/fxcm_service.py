@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 from dateutil import parser
-from forexconnect import ForexConnect
+from forexconnect import ForexConnect, fxcorepy
 
 from app.core.config import get_settings
 
@@ -154,21 +154,33 @@ class FXCMHistoryService:
         self._response_cache = _TTLCache()
         self._fx = ForexConnect()
         self._connection_lock = Lock()
+        self._history_request_lock = Lock()
+        self._connection_generation = 0
+        self._needs_connection_reset = False
 
     def _ensure_connected(self) -> ForexConnect:
         with self._connection_lock:
             try:
                 # 若底层引擎已断开，会返回 False
-                connected = self._fx.is_connected()
+                connected = self.is_connected(self._fx)
             except Exception:
                 connected = False
 
             if not connected:
+                if self._needs_connection_reset:
+                    self._fx = ForexConnect()
+                    self._needs_connection_reset = False
                 logger.info(
                     "FXCM session is disconnected or not initialized. Initiating login..."
                 )
                 self._login(self._fx)
             return self._fx
+
+    @staticmethod
+    def is_connected(fx: ForexConnect) -> bool:
+        # ForexConnect 1.6.43 exposes session.session_status, not is_connected().
+        return (fx.session is not None and fx.session.session_status ==
+                fxcorepy.AO2GSessionStatus.O2GSessionStatus.CONNECTED)
 
     def fetch_history(
         self,
@@ -555,13 +567,16 @@ class FXCMHistoryService:
         quotes_count: int,
     ) -> Any:
         try:
-            return fx.get_history(
-                instrument,
-                timeframe,
-                start_date,
-                end_date,
-                quotes_count,
-            )
+            # The SDK reuses one price-history communicator on this session.
+            # Serialize snapshots and scheduled history pulls through it.
+            with self._history_request_lock:
+                return fx.get_history(
+                    instrument,
+                    timeframe,
+                    start_date,
+                    end_date,
+                    quotes_count,
+                )
         except Exception as exc:
             error_text = str(exc)
             if "QuotesServerConnectionError" in error_text:
@@ -1096,18 +1111,13 @@ class FXCMHistoryService:
 
     def _on_session_status_changed(self, session: Any, status: Any) -> None:
         logger.info("FXCM session status: %s", status)
-        # 0 = Disconnected
-        if status == 0:
-            with self._connection_lock:
-                try:
-                    logger.info(
-                        "FXCM session disconnected. Re-initializing ForexConnect..."
-                    )
-                    self._fx = ForexConnect()
-                except Exception as exc:
-                    logger.warning(
-                        f"Failed to cleanly recreate ForexConnect instance: {exc}"
-                    )
+        # login() waits for this native callback while holding _connection_lock.
+        # Never acquire that lock or replace the SDK object from its own callback.
+        statuses = fxcorepy.AO2GSessionStatus.O2GSessionStatus
+        if status in (statuses.DISCONNECTED, statuses.RECONNECTING):
+            self._connection_generation += 1
+        if status == statuses.DISCONNECTED:
+            self._needs_connection_reset = True
 
 
 fxcm_history_service = FXCMHistoryService()

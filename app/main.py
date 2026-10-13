@@ -2,6 +2,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.routers.history import router as history_router
+from app.routers.realtime import router as realtime_router
+from app.services.realtime import realtime_hub
 from app.services.fxcm_service import FXCMServiceError
 
 
@@ -28,3 +30,9 @@ async def handle_fxcm_service_error(
 
 
 app.include_router(history_router)
+app.include_router(realtime_router)
+
+
+@app.on_event("shutdown")
+async def close_realtime():
+    await realtime_hub.close()
