@@ -44,6 +44,17 @@ class Command(BaseModel):
         allow_inf_nan = False
 
 
+@router.get("/history")
+def history(
+    account_id: Optional[str] = Query(None, min_length=1, max_length=64),
+    from_ts: Optional[float] = Query(None, ge=0),
+    to_ts: Optional[float] = Query(None, ge=0),
+):
+    if from_ts is not None and to_ts is not None and from_ts >= to_ts:
+        raise HTTPException(400, "交易记录时间范围无效")
+    return demo_trading.history(account_id, from_ts, to_ts)
+
+
 @router.get("/state")
 def state(symbol: str = Query(..., min_length=1, max_length=64), account_id: Optional[str] = None):
     return demo_trading.snapshot(symbol, account_id)

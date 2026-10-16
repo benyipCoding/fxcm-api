@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace as Row
 from unittest.mock import patch
@@ -94,6 +95,55 @@ class TradingTests(unittest.TestCase):
         self.assertEqual((p["gross_pl"], p["commission"], p["rollover"], p["net_pl"]), (10, 2, -3, 5))
         row.commission = None
         self.assertIsNone(self.service.position(row, {"1": self.offer})["net_pl"])
+
+    def test_history_refreshes_fxcm_closed_trade_table_and_filters_dates(self):
+        closed = [
+            Row(
+                trade_id="new",
+                account_id="demo",
+                offer_id="1",
+                buy_sell="B",
+                amount=1000,
+                open_rate=1.1,
+                open_time=datetime(2026, 10, 17, 1, tzinfo=timezone.utc),
+                close_rate=1.2,
+                close_time=datetime(2026, 10, 17, 2, tzinfo=timezone.utc),
+                gross_pl=10,
+                commission=0,
+                rollover_interest=0,
+            ),
+            Row(
+                trade_id="old",
+                account_id="demo",
+                offer_id="1",
+                buy_sell="S",
+                amount=1000,
+                open_rate=1.2,
+                open_time=datetime(2026, 10, 16, 1, tzinfo=timezone.utc),
+                close_rate=1.1,
+                close_time=datetime(2026, 10, 16, 2, tzinfo=timezone.utc),
+                gross_pl=10,
+                commission=0,
+                rollover_interest=0,
+            ),
+        ]
+        self.fx.session = Row(server_time=datetime(2026, 10, 17, 3, tzinfo=timezone.utc))
+        self.fx.get_table = lambda table: (
+            [self.account]
+            if table == ForexConnect.ACCOUNTS
+            else [self.offer]
+            if table == ForexConnect.OFFERS
+            else []
+        )
+        self.service.currency = lambda fx: "USD"
+        with patch("app.services.trading.require_demo_trading"), patch(
+            "app.services.trading.Common.refresh_table_by_account", return_value=closed
+        ) as refresh:
+            result = self.service.history("demo", 1792195200, 1792281600)
+
+        refresh.assert_called_once_with(self.fx, ForexConnect.CLOSED_TRADES, "demo")
+        self.assertEqual([item["trade_id"] for item in result["items"]], ["new"])
+        self.assertEqual(result["account"], {"id": "demo", "currency": "USD"})
 
 
 if __name__ == "__main__": unittest.main()

@@ -56,6 +56,6 @@ Tests: `.\.venv\Scripts\python.exe -m unittest discover -s tests -v` (no broker 
 
 ## Local Demo trading
 
-ForexConnect Demo execution is available at `/trading/state`, `/trading/stream`, `/trading/commands` and `/trading/commands/{client_id}`. In addition to the realtime flags, enable `FXCM_TRADING_ENABLED=true` and configure a random `FXCM_TRADING_BRIDGE_KEY` shared with the backend. Requests require the `X-FXCM-Bridge-Key` header. Real connections and production environments are rejected. Use one worker bound to loopback.
+ForexConnect Demo execution is available at `/trading/state`, `/trading/stream`, `/trading/history`, `/trading/commands` and `/trading/commands/{client_id}`. `/trading/history` refreshes the official ForexConnect `CLOSED_TRADES` table for the selected account and supports optional `from_ts` / `to_ts` Unix-second filters. In addition to the realtime flags, enable `FXCM_TRADING_ENABLED=true` and configure a random `FXCM_TRADING_BRIDGE_KEY` shared with the backend. Requests require the `X-FXCM-Bridge-Key` header. Real connections and production environments are rejected. Use one worker bound to loopback.
 
 Commands are recorded in the Git-ignored `.local/trading.sqlite3` before dispatch. Reusing a command ID never resends an order, including after process restart; uncertain results must be reconciled, not retried as new orders. Account snapshots come from SDK tables. See [the Demo trading guide](../shl-solver-backend/docs/fxcm-demo-trading.md) for execution, fees, permissions, setup and validation.
