@@ -80,8 +80,9 @@ offer_subscriptions = OfferSubscriptions()
 
 
 class Feed:
-    def __init__(self, symbol, interval):
+    def __init__(self, symbol, interval, snapshot_size=256):
         self.symbol, self.interval = symbol, interval
+        self.snapshot_size = snapshot_size
         self.lock = Lock()
         self.pending = deque(maxlen=20000)
         self.overflow = False
@@ -128,8 +129,8 @@ class Feed:
         raw = service._get_history_or_raise(
             self.fx, instrument=self.symbol, timeframe=spec.provider_interval,
             start_date=None, end_date=None,
-            quotes_count=service._resolve_quotes_count(self.interval, 5000))
-        rows = service._aggregate_rows(service._normalize_history_rows(raw), self.interval)[-5000:]
+            quotes_count=service._resolve_quotes_count(self.interval, self.snapshot_size))
+        rows = service._aggregate_rows(service._normalize_history_rows(raw), self.interval)[-self.snapshot_size:]
         self.book = LiveCandles(service, self.interval, rows)
         self.meta = {"symbol": self.symbol, "interval": self.interval, "price_type": "mid"}
         # Replay buffered extrema then apply the newest offer. Never end with an
@@ -215,24 +216,50 @@ class Feed:
 
 
 class RealtimeHub:
-    def __init__(self):
+    def __init__(self, idle_seconds=30, max_idle=4):
         self.channels = {}
+        self.idle_seconds = idle_seconds
+        self.max_idle = max_idle
+        self.retiring = set()
 
-    async def subscribe(self, symbol, interval):
-        key = (fxcm_history_service._normalize_lookup(symbol), interval)
+    async def subscribe(self, symbol, interval, snapshot_size=256):
+        key = (fxcm_history_service._normalize_lookup(symbol), interval, snapshot_size)
         queue = asyncio.Queue(maxsize=32)
         channel = self.channels.get(key)
         if channel is not None and channel["task"].done():
+            if channel.get("expiry"):
+                channel["expiry"].cancel()
             self.channels.pop(key, None)
             channel = None
         if channel is None:
             if len(self.channels) >= 16:
+                self.evict_idle(keep=max(0, self.max_idle - 1), force_one=True)
+            if len(self.channels) >= 16:
                 raise FXCMServiceError(429, "Too many realtime instruments")
-            channel = {"queues": set(), "feed": None, "task": None}
+            channel = {"queues": set(), "feed": None, "task": None, "expiry": None, "idle_at": 0}
             self.channels[key] = channel
-            channel["task"] = asyncio.create_task(self.run(channel, symbol, interval))
+            channel["task"] = asyncio.create_task(self.run(channel, symbol, interval, snapshot_size))
+        if channel["expiry"] is not None:
+            channel["expiry"].cancel()
+            channel["expiry"] = None
         channel["queues"].add(queue)
         if channel["feed"] is not None:
+            # Drain pending ticks before returning a cached snapshot. Session
+            # validation prevents reuse after an SDK disconnect/relogin.
+            try:
+                event = channel["feed"].poll()
+                if event:
+                    self.publish(channel, event)
+                    if len(event["candles"]) > 1:
+                        channel["needs_repair"] = True
+            except Exception:
+                channel["queues"].discard(queue)
+                self.publish(channel, {"type": "error", "message": "FXCM 会话已变化，正在重连", "retryable": True})
+                self.retire(key, channel)
+                return await self.subscribe(symbol, interval, snapshot_size)
+            # The joining client needs the snapshot before any deltas.
+            while not queue.empty():
+                queue.get_nowait()
             queue.put_nowait(channel["feed"].snapshot())
         return key, queue
 
@@ -245,8 +272,8 @@ class RealtimeHub:
             else:
                 queue.put_nowait(event)
 
-    async def run(self, channel, symbol, interval):
-        feed = Feed(symbol, interval)
+    async def run(self, channel, symbol, interval, snapshot_size=256):
+        feed = Feed(symbol, interval, snapshot_size)
         repair = None
         try:
             opening = asyncio.create_task(run_in_threadpool(feed.open))
@@ -267,9 +294,12 @@ class RealtimeHub:
                 event = feed.poll()
                 if event:
                     self.publish(channel, event)
-                    if len(event["candles"]) > 1 and repair is None:
-                        # Reconcile once per candle boundary, not once per tick.
-                        repair = asyncio.create_task(run_in_threadpool(feed.fetch_closed))
+                    if len(event["candles"]) > 1:
+                        channel["needs_repair"] = True
+                if repair is None and channel["queues"] and channel.pop("needs_repair", False):
+                    # Idle feeds retain quotes without polling history. Reconcile
+                    # any completed bar when a viewer comes back, too.
+                    repair = asyncio.create_task(run_in_threadpool(feed.fetch_closed))
                 if repair is not None and repair.done():
                     try:
                         repaired = feed.apply_closed(repair.result())
@@ -300,17 +330,39 @@ class RealtimeHub:
             return
         channel["queues"].discard(queue)
         if not channel["queues"]:
-            self.channels.pop(key, None)
-            channel["task"].cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await channel["task"]
+            if self.idle_seconds <= 0:
+                task = self.retire(key, channel)
+                if task:
+                    await asyncio.gather(task, return_exceptions=True)
+                return
+            channel["idle_at"] = monotonic()
+            channel["expiry"] = asyncio.get_running_loop().call_later(
+                self.idle_seconds, self.retire, key, channel)
+            self.evict_idle(self.max_idle)
+
+    def retire(self, key, channel):
+        if self.channels.get(key) is not channel:
+            return None
+        self.channels.pop(key)
+        if channel.get("expiry"):
+            channel["expiry"].cancel()
+        task = channel["task"]
+        task.cancel()
+        self.retiring.add(task)
+        task.add_done_callback(self.retiring.discard)
+        return task
+
+    def evict_idle(self, keep, force_one=False):
+        idle = sorted(((key, channel) for key, channel in self.channels.items() if not channel["queues"]),
+                      key=lambda item: item[1]["idle_at"])
+        count = max(len(idle) - keep, 1 if force_one and idle else 0)
+        for key, channel in idle[:count]:
+            self.retire(key, channel)
 
     async def close(self):
-        channels = list(self.channels.values())
-        self.channels.clear()
-        for channel in channels:
-            channel["task"].cancel()
-        await asyncio.gather(*(c["task"] for c in channels), return_exceptions=True)
+        for key, channel in list(self.channels.items()):
+            self.retire(key, channel)
+        await asyncio.gather(*list(self.retiring), return_exceptions=True)
 
 
 realtime_hub = RealtimeHub()

@@ -11,7 +11,8 @@ router = APIRouter(prefix="/realtime", tags=["FXCM realtime"])
 
 
 @router.get("/stream")
-async def stream(symbol: str = Query(..., min_length=1, max_length=64), interval: str = "1h"):
+async def stream(symbol: str = Query(..., min_length=1, max_length=64), interval: str = "1h",
+                 snapshot_size: int = Query(256, ge=2, le=5000)):
     if not realtime_enabled():
         raise HTTPException(404, "Realtime is disabled outside local development")
     interval = fxcm_history_service._resolve_interval_name(interval)
@@ -19,7 +20,7 @@ async def stream(symbol: str = Query(..., min_length=1, max_length=64), interval
 
     async def events():
         try:
-            key, queue = await realtime_hub.subscribe(symbol, interval)
+            key, queue = await realtime_hub.subscribe(symbol, interval, snapshot_size)
         except FXCMServiceError as exc:
             yield "data: " + json.dumps({"type": "error", "message": exc.message, "retryable": False}) + "\n\n"
             return

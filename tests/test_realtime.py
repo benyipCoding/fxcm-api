@@ -160,7 +160,7 @@ class LifecycleTest(unittest.TestCase):
 
     def test_multiple_tabs_share_one_feed_and_last_close_cleans_it(self):
         async def run():
-            hub = RealtimeHub()
+            hub = RealtimeHub(idle_seconds=0)
             async def worker(*args):
                 await asyncio.sleep(3600)
             with patch.object(hub, "run", side_effect=worker) as worker_mock:
@@ -171,6 +171,126 @@ class LifecycleTest(unittest.TestCase):
                 self.assertEqual(len(hub.channels), 1)
                 await hub.unsubscribe(key, second)
                 self.assertFalse(hub.channels)
+        asyncio.run(run())
+
+    def test_quick_snapshot_limits_provider_history_without_changing_full_recovery(self):
+        service = FXCMHistoryService.__new__(FXCMHistoryService)
+        service._ensure_connected = Mock(return_value=Mock())
+        service._connection_generation = 1
+        offer = SimpleNamespace(instrument="EUR/USD", time=datetime(2026, 10, 13, 13, 0, 1), bid=10, ask=12)
+        service._find_offer = Mock(return_value=offer)
+        service._get_history_or_raise = Mock(return_value=[])
+        service._normalize_history_rows = Mock(return_value=[row("2026-10-13T13:00:00")])
+        service._aggregate_rows = Mock(side_effect=lambda rows, interval: rows)
+        with patch("app.services.realtime.fxcm_history_service", service), \
+                patch("app.services.realtime.offer_subscriptions.acquire", return_value="EUR/USD"), \
+                patch("app.services.realtime.Common.subscribe_table_updates"):
+            for size in (256, 5000):
+                feed = Feed("EUR/USD", "1min", size)
+                snapshot = feed.open()
+                self.assertEqual(service._get_history_or_raise.call_args[1]["quotes_count"], size)
+                self.assertEqual(snapshot["type"], "snapshot")
+                self.assertEqual(snapshot["quote"]["bid"], 10)
+
+    def test_recent_chart_reuses_feed_and_expired_idle_feed_is_cleaned(self):
+        async def run():
+            hub = RealtimeHub(idle_seconds=0.04)
+            async def worker(channel, *args):
+                channel["feed"] = Mock()
+                channel["feed"].poll.return_value = None
+                channel["feed"].snapshot.return_value = {"type": "snapshot", "candles": [1]}
+                hub.publish(channel, channel["feed"].snapshot())
+                await asyncio.sleep(3600)
+            with patch.object(hub, "run", side_effect=worker) as calls:
+                try:
+                    key, first = await hub.subscribe("EUR/USD", "1min")
+                    await asyncio.wait_for(first.get(), 1)
+                    await hub.unsubscribe(key, first)
+                    self.assertIn(key, hub.channels)
+                    _, second = await hub.subscribe("EUR/USD", "1min")
+                    self.assertEqual((await second.get())["type"], "snapshot")
+                    self.assertEqual(calls.call_count, 1)
+                    await asyncio.sleep(0.06)
+                    self.assertIn(key, hub.channels)  # Old expiry cannot close an active client.
+                    await hub.unsubscribe(key, second)
+                    await asyncio.sleep(0.06)
+                    self.assertNotIn(key, hub.channels)
+                finally:
+                    await hub.close()
+        asyncio.run(run())
+
+    def test_idle_limit_never_evicts_active_clients_and_shutdown_cancels_timers(self):
+        async def run():
+            hub = RealtimeHub(idle_seconds=30, max_idle=1)
+            async def worker(*args):
+                await asyncio.sleep(3600)
+            with patch.object(hub, "run", side_effect=worker):
+                active_key, active = await hub.subscribe("EUR/USD", "1min")
+                old_key, old = await hub.subscribe("EUR/USD", "1h")
+                new_key, new = await hub.subscribe("EUR/USD", "4h")
+                await hub.unsubscribe(old_key, old)
+                old_expiry = hub.channels[old_key]["expiry"]
+                await hub.unsubscribe(new_key, new)
+                self.assertNotIn(old_key, hub.channels)
+                self.assertTrue(old_expiry.cancelled())
+                self.assertIn(active_key, hub.channels)
+                self.assertIn(new_key, hub.channels)
+                expiry = hub.channels[new_key]["expiry"]
+                await hub.close()
+                self.assertTrue(expiry.cancelled())
+                self.assertFalse(hub.channels)
+                self.assertFalse(hub.retiring)
+        asyncio.run(run())
+
+    def test_stale_session_is_not_reused_and_deep_snapshot_has_separate_capacity(self):
+        async def run():
+            hub = RealtimeHub()
+            async def worker(channel, *args):
+                channel["feed"] = Mock()
+                channel["feed"].poll.return_value = None
+                channel["feed"].snapshot.return_value = {"type": "snapshot"}
+                hub.publish(channel, {"type": "snapshot"})
+                await asyncio.sleep(3600)
+            with patch.object(hub, "run", side_effect=worker) as calls:
+                try:
+                    key, first = await hub.subscribe("EUR/USD", "1min")
+                    await asyncio.wait_for(first.get(), 1)
+                    hub.channels[key]["feed"].poll.side_effect = RuntimeError("disconnected")
+                    _, second = await hub.subscribe("EUR/USD", "1min")
+                    self.assertEqual((await first.get())["type"], "error")
+                    self.assertEqual((await asyncio.wait_for(second.get(), 1))["type"], "snapshot")
+                    self.assertEqual(calls.call_count, 2)
+                    deep_key, deep = await hub.subscribe("EUR/USD", "1min", 5000)
+                    self.assertNotEqual(key, deep_key)
+                    await asyncio.wait_for(deep.get(), 1)
+                    self.assertEqual(calls.call_count, 3)
+                finally:
+                    await hub.close()
+        asyncio.run(run())
+
+    def test_idle_bar_rollover_defers_history_calibration_until_a_viewer_returns(self):
+        async def run():
+            hub = RealtimeHub(idle_seconds=3)
+            feed = Mock()
+            feed.open.return_value = feed.snapshot.return_value = {"type": "snapshot"}
+            events = [{"type": "candles", "candles": [1, 2]}]
+            feed.poll.side_effect = lambda: events.pop() if events else None
+            feed.apply_closed.return_value = None
+            with patch("app.services.realtime.Feed", return_value=feed):
+                try:
+                    key, queue = await hub.subscribe("EUR/USD", "1min")
+                    await asyncio.wait_for(queue.get(), 1)
+                    await hub.unsubscribe(key, queue)
+                    await asyncio.sleep(0.6)
+                    feed.fetch_closed.assert_not_called()
+                    self.assertTrue(hub.channels[key]["needs_repair"])
+                    _, resumed = await hub.subscribe("EUR/USD", "1min")
+                    self.assertEqual((await resumed.get())["type"], "snapshot")
+                    await asyncio.sleep(0.6)
+                    feed.fetch_closed.assert_called_once()
+                finally:
+                    await hub.close()
+            feed.close.assert_called_once()
         asyncio.run(run())
 
 
