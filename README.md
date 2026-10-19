@@ -41,7 +41,7 @@ The service reuses the existing `.env` file and expects:
 ## Notes
 
 - `price_type` supports `bid`, `ask`, and `mid`.
-- `45min`, `2h`, `4h`, and `8h` are aggregated from smaller FXCM base intervals.
+- `45min`, `2h`, `3h`, `4h`, `6h`, and `8h` are aggregated from smaller FXCM base intervals.
 - Historical requests reuse the ForexConnect session. SDK history requests are serialized through its shared history communicator.
 
 ## Local realtime mode

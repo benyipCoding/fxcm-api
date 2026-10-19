@@ -32,7 +32,7 @@ async def get_history(
     interval: str = Query(
         "1h",
         description=(
-            "Requested interval. Supported values: 1min, 5min, 15min, 30min, 45min, 1h, 2h, 4h, 8h, 1day, 1week, 1month."
+            "Requested interval. Supported values: 1min, 5min, 15min, 30min, 45min, 1h, 2h, 3h, 4h, 6h, 8h, 1day, 1week, 1month."
         ),
     ),
     outputsize: int = Query(120, ge=1, le=5000),

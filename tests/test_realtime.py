@@ -71,10 +71,47 @@ class CandleTest(unittest.TestCase):
         self.assertEqual(live.bucket(epoch("2026-11-30T22:00:00")), epoch("2026-11-30T22:00:00"))
 
     def test_derived_intervals_match_existing_utc_aggregation(self):
-        for interval, seconds in (("45min", 2700), ("2h", 7200), ("4h", 14400), ("8h", 28800)):
+        for interval, seconds in (
+            ("45min", 2700),
+            ("2h", 7200),
+            ("3h", 10800),
+            ("4h", 14400),
+            ("6h", 21600),
+            ("8h", 28800),
+        ):
             live = book(interval, "2026-10-13T00:00:00")
             time = epoch("2026-10-13T19:38:14")
             self.assertEqual(live.bucket(time), int(time) // seconds * seconds)
+
+    def test_history_aggregation_supports_new_hour_intervals(self):
+        service = FXCMHistoryService.__new__(FXCMHistoryService)
+        rows = [
+            row(f"2026-10-13T{hour:02}:00:00", bid=10 + hour, ask=12 + hour)
+            for hour in (0, 1, 2, 3, 6)
+        ]
+
+        for interval, expected_timestamps in (
+            (
+                "3h",
+                (
+                    epoch("2026-10-13T00:00:00"),
+                    epoch("2026-10-13T03:00:00"),
+                    epoch("2026-10-13T06:00:00"),
+                ),
+            ),
+            (
+                "6h",
+                (epoch("2026-10-13T00:00:00"), epoch("2026-10-13T06:00:00")),
+            ),
+        ):
+            aggregated = service._aggregate_rows(rows, interval)
+            self.assertEqual(
+                [item["timestamp"] for item in aggregated],
+                list(expected_timestamps),
+            )
+            self.assertEqual(aggregated[0]["bid_open"], 10)
+            self.assertEqual(aggregated[0]["bid_high"], 12 if interval == "3h" else 13)
+            self.assertEqual(aggregated[0]["bid_close"], 12 if interval == "3h" else 13)
 
     def test_authoritative_close_repairs_volume_without_rewinding_live_bar(self):
         feed = Feed("EUR/USD", "1min")

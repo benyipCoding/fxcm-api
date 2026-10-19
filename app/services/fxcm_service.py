@@ -87,7 +87,9 @@ class FXCMHistoryService:
         "45min": IntervalSpec(provider_interval="m15", bucket_seconds=2700),
         "1h": IntervalSpec(provider_interval="H1", bucket_seconds=3600),
         "2h": IntervalSpec(provider_interval="H1", bucket_seconds=7200),
+        "3h": IntervalSpec(provider_interval="H1", bucket_seconds=10800),
         "4h": IntervalSpec(provider_interval="H1", bucket_seconds=14400),
+        "6h": IntervalSpec(provider_interval="H1", bucket_seconds=21600),
         "8h": IntervalSpec(provider_interval="H1", bucket_seconds=28800),
         "1day": IntervalSpec(provider_interval="D1", bucket_seconds=86400),
         "1week": IntervalSpec(provider_interval="W1", bucket_seconds=604800),
@@ -657,7 +659,7 @@ class FXCMHistoryService:
         rows: Sequence[Mapping[str, Any]],
         requested_interval: str,
     ) -> List[Dict[str, Any]]:
-        if requested_interval not in {"45min", "2h", "4h", "8h"}:
+        if requested_interval not in {"45min", "2h", "3h", "4h", "6h", "8h"}:
             return [dict(row) for row in rows if isinstance(row, Mapping)]
 
         interval_spec = self._get_interval_spec(requested_interval)
@@ -842,6 +844,11 @@ class FXCMHistoryService:
             "45m": "45min",
             "60m": "1h",
             "h1": "1h",
+            "h2": "2h",
+            "h3": "3h",
+            "h4": "4h",
+            "h6": "6h",
+            "h8": "8h",
             "d1": "1day",
             "w1": "1week",
             "mo1": "1month",
