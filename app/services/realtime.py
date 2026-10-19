@@ -80,9 +80,11 @@ offer_subscriptions = OfferSubscriptions()
 
 
 class Feed:
-    def __init__(self, symbol, interval, snapshot_size=256):
+    def __init__(self, symbol, interval, snapshot_size=256, seed_timestamp=None, seed_price=None):
         self.symbol, self.interval = symbol, interval
         self.snapshot_size = snapshot_size
+        self.seed_timestamp = seed_timestamp
+        self.seed_price = seed_price
         self.lock = Lock()
         self.pending = deque(maxlen=20000)
         self.overflow = False
@@ -125,12 +127,27 @@ class Feed:
         # Subscribe BEFORE history: updates arriving during the snapshot are buffered.
         self.listener = Common.subscribe_table_updates(
             self.fx.get_table(ForexConnect.OFFERS), on_change_callback=self.on_quote)
-        spec = service.INTERVAL_SPECS[self.interval]
-        raw = service._get_history_or_raise(
-            self.fx, instrument=self.symbol, timeframe=spec.provider_interval,
-            start_date=None, end_date=None,
-            quotes_count=service._resolve_quotes_count(self.interval, self.snapshot_size))
-        rows = service._aggregate_rows(service._normalize_history_rows(raw), self.interval)[-self.snapshot_size:]
+        if self.seed_timestamp is not None and self.seed_price is not None:
+            # The chart already owns the historical window. Seeding from its
+            # last candle lets realtime start immediately even when FXCM's
+            # historical quote server is slow or unavailable.
+            price = float(self.seed_price)
+            timestamp = float(self.seed_timestamp)
+            rows = [{
+                "timestamp": timestamp,
+                "datetime": service._format_datetime(timestamp),
+                "volume": None,
+                **{side + "_" + field: price
+                   for side in ("bid", "ask")
+                   for field in ("open", "high", "low", "close")},
+            }]
+        else:
+            spec = service.INTERVAL_SPECS[self.interval]
+            raw = service._get_history_or_raise(
+                self.fx, instrument=self.symbol, timeframe=spec.provider_interval,
+                start_date=None, end_date=None,
+                quotes_count=service._resolve_quotes_count(self.interval, self.snapshot_size))
+            rows = service._aggregate_rows(service._normalize_history_rows(raw), self.interval)[-self.snapshot_size:]
         self.book = LiveCandles(service, self.interval, rows)
         self.meta = {"symbol": self.symbol, "interval": self.interval, "price_type": "mid"}
         # Replay buffered extrema then apply the newest offer. Never end with an
@@ -222,8 +239,9 @@ class RealtimeHub:
         self.max_idle = max_idle
         self.retiring = set()
 
-    async def subscribe(self, symbol, interval, snapshot_size=256):
-        key = (fxcm_history_service._normalize_lookup(symbol), interval, snapshot_size)
+    async def subscribe(self, symbol, interval, snapshot_size=256, seed_timestamp=None, seed_price=None):
+        key = (fxcm_history_service._normalize_lookup(symbol), interval, snapshot_size,
+               seed_timestamp, seed_price)
         queue = asyncio.Queue(maxsize=32)
         channel = self.channels.get(key)
         if channel is not None and channel["task"].done():
@@ -238,7 +256,8 @@ class RealtimeHub:
                 raise FXCMServiceError(429, "Too many realtime instruments")
             channel = {"queues": set(), "feed": None, "task": None, "expiry": None, "idle_at": 0}
             self.channels[key] = channel
-            channel["task"] = asyncio.create_task(self.run(channel, symbol, interval, snapshot_size))
+            channel["task"] = asyncio.create_task(
+                self.run(channel, symbol, interval, snapshot_size, seed_timestamp, seed_price))
         if channel["expiry"] is not None:
             channel["expiry"].cancel()
             channel["expiry"] = None
@@ -256,7 +275,7 @@ class RealtimeHub:
                 channel["queues"].discard(queue)
                 self.publish(channel, {"type": "error", "message": "FXCM 会话已变化，正在重连", "retryable": True})
                 self.retire(key, channel)
-                return await self.subscribe(symbol, interval, snapshot_size)
+                return await self.subscribe(symbol, interval, snapshot_size, seed_timestamp, seed_price)
             # The joining client needs the snapshot before any deltas.
             while not queue.empty():
                 queue.get_nowait()
@@ -272,8 +291,8 @@ class RealtimeHub:
             else:
                 queue.put_nowait(event)
 
-    async def run(self, channel, symbol, interval, snapshot_size=256):
-        feed = Feed(symbol, interval, snapshot_size)
+    async def run(self, channel, symbol, interval, snapshot_size=256, seed_timestamp=None, seed_price=None):
+        feed = Feed(symbol, interval, snapshot_size, seed_timestamp, seed_price)
         repair = None
         try:
             opening = asyncio.create_task(run_in_threadpool(feed.open))

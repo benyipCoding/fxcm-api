@@ -192,6 +192,23 @@ class LifecycleTest(unittest.TestCase):
                 self.assertEqual(snapshot["type"], "snapshot")
                 self.assertEqual(snapshot["quote"]["bid"], 10)
 
+    def test_chart_seed_starts_realtime_without_provider_history(self):
+        service = FXCMHistoryService.__new__(FXCMHistoryService)
+        service._ensure_connected = Mock(return_value=Mock())
+        service._connection_generation = 1
+        offer = SimpleNamespace(instrument="EUR/USD", subscription_status="T", offer_id="1",
+                                time=datetime(2026, 10, 19, 15, 0, 1), bid=10, ask=12)
+        service._find_offer = Mock(return_value=offer)
+        service._get_history_or_raise = Mock(side_effect=AssertionError("history should not be requested"))
+        with patch("app.services.realtime.fxcm_history_service", service), \
+                patch("app.services.realtime.offer_subscriptions.acquire", return_value="EUR/USD"), \
+                patch("app.services.realtime.Common.subscribe_table_updates"):
+            feed = Feed("EUR/USD", "1min", seed_timestamp=epoch("2026-10-19T14:59:00"), seed_price=11)
+            snapshot = feed.open()
+        self.assertEqual(snapshot["candles"][0]["close"], 11)
+        self.assertEqual(snapshot["quote"]["bid"], 10)
+        service._get_history_or_raise.assert_not_called()
+
     def test_recent_chart_reuses_feed_and_expired_idle_feed_is_cleaned(self):
         async def run():
             hub = RealtimeHub(idle_seconds=0.04)

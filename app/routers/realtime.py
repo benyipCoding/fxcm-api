@@ -1,4 +1,5 @@
 import json
+from typing import Optional
 import anyio
 
 from fastapi import APIRouter, HTTPException, Query
@@ -12,7 +13,9 @@ router = APIRouter(prefix="/realtime", tags=["FXCM realtime"])
 
 @router.get("/stream")
 async def stream(symbol: str = Query(..., min_length=1, max_length=64), interval: str = "1h",
-                 snapshot_size: int = Query(256, ge=2, le=5000)):
+                 snapshot_size: int = Query(256, ge=2, le=5000),
+                 seed_timestamp: Optional[float] = Query(None, gt=0),
+                 seed_price: Optional[float] = Query(None, gt=0)):
     if not realtime_enabled():
         raise HTTPException(404, "Realtime is disabled outside local development")
     interval = fxcm_history_service._resolve_interval_name(interval)
@@ -20,7 +23,11 @@ async def stream(symbol: str = Query(..., min_length=1, max_length=64), interval
 
     async def events():
         try:
-            key, queue = await realtime_hub.subscribe(symbol, interval, snapshot_size)
+            key, queue = await realtime_hub.subscribe(
+                symbol, interval, snapshot_size,
+                seed_timestamp=seed_timestamp if seed_price is not None else None,
+                seed_price=seed_price if seed_timestamp is not None else None,
+            )
         except FXCMServiceError as exc:
             yield "data: " + json.dumps({"type": "error", "message": exc.message, "retryable": False}) + "\n\n"
             return
