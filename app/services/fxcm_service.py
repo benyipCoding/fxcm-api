@@ -79,6 +79,10 @@ class FXCMHistoryService:
     LOGIN_MAX_ATTEMPTS = 2
     BATCH_QUOTES_CACHE_TTL_SECONDS = 8
     MARKET_SYMBOLS_CACHE_TTL_SECONDS = 20
+    # One chart page / realtime snapshot. Derived intervals (45min, 2h-8h) need
+    # several provider bars per output bar, so raw requests get a higher cap.
+    MAX_OUTPUT_BARS = 20000
+    MAX_RAW_QUOTES = 200000
     INTERVAL_SPECS = {
         "1min": IntervalSpec(provider_interval="m1", bucket_seconds=60),
         "5min": IntervalSpec(provider_interval="m5", bucket_seconds=300),
@@ -815,7 +819,10 @@ class FXCMHistoryService:
         multiplier = max(1, int(bucket_seconds / provider_bucket_seconds))
         if multiplier <= 1:
             return outputsize
-        return min(5000, max(outputsize * multiplier + multiplier * 2, outputsize))
+        return min(
+            self.MAX_RAW_QUOTES,
+            max(outputsize * multiplier + multiplier * 2, outputsize),
+        )
 
     def _parse_request_datetime(self, value: Optional[str]) -> Optional[datetime]:
         if value is None:

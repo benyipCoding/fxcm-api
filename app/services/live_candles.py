@@ -68,7 +68,7 @@ class LiveCandles:
                    for side in ("bid", "ask") for field in ("open", "high", "low", "close")},
             }
             self.rows.append(last)
-            self.rows = self.rows[-5000:]
+            self.rows = self.rows[-self.service.MAX_OUTPUT_BARS:]
         for side, price in (("bid", bid), ("ask", ask)):
             last[side + "_high"] = max(last[side + "_high"], price)
             last[side + "_low"] = min(last[side + "_low"], price)

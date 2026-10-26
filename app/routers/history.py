@@ -11,7 +11,7 @@ from app.schemas.history import (
     QuoteResponse,
     SymbolSearchResponse,
 )
-from app.services.fxcm_service import fxcm_history_service
+from app.services.fxcm_service import FXCMHistoryService, fxcm_history_service
 
 
 router = APIRouter(tags=["FXCM"])
@@ -35,7 +35,7 @@ async def get_history(
             "Requested interval. Supported values: 1min, 5min, 15min, 30min, 45min, 1h, 2h, 3h, 4h, 6h, 8h, 1day, 1week, 1month."
         ),
     ),
-    outputsize: int = Query(120, ge=1, le=5000),
+    outputsize: int = Query(120, ge=1, le=FXCMHistoryService.MAX_OUTPUT_BARS),
     start_date: Optional[str] = Query(
         None,
         description="Optional ISO-like start date, for example 2026-05-01 or 2026-05-01T00:00:00Z.",
