@@ -16,6 +16,14 @@ from app.services.fxcm_service import FXCMServiceError, fxcm_history_service
 from app.services.realtime import realtime_enabled
 
 
+# Pending (entry) order types in the ORDERS table. Limit entries wait for a
+# better price, stop entries for a breakout; RE/RTE are range entries.
+ENTRY_ORDER_TYPES = {"LE", "SE", "LTE", "STE", "RE", "RTE"}
+LIMIT_ENTRY_TYPES = {"LE", "LTE"}
+STOP_ENTRY_TYPES = {"SE", "STE"}
+ENTRY_ACTIONS = {"entry", "entry_edit", "entry_cancel", "entry_risk"}
+
+
 def require_demo_trading():
     if not realtime_enabled() or os.getenv("FXCM_TRADING_ENABLED", "false").lower() != "true":
         raise FXCMServiceError(404, "本地福汇交易未启用")
@@ -161,10 +169,23 @@ class DemoTradingService:
         offers = {row.offer_id: row for row in fx.get_table(ForexConnect.OFFERS)}
         positions = [self.position(row, offers) for row in fx.get_table(ForexConnect.TRADES) if row.account_id == account.account_id]
         closed = [self.position(row, offers, True) for row in fx.get_table(ForexConnect.CLOSED_TRADES) if row.account_id == account.account_id]
+        order_rows = [row for row in fx.get_table(ForexConnect.ORDERS) if row.account_id == account.account_id]
+        by_id = {row.order_id: row for row in order_rows}
+
+        def attached_rate(order_id):
+            row = by_id.get(order_id) if order_id else None
+            return number(row, "rate") if row is not None else None
+
         orders = [{"order_id": row.order_id, "trade_id": row.trade_id, "type": row.type,
                    "status": row.status, "rate": number(row, "rate"), "amount": int(row.amount),
-                   "custom_id": getattr(row, "request_txt", None)}
-                  for row in fx.get_table(ForexConnect.ORDERS) if row.account_id == account.account_id]
+                   "custom_id": getattr(row, "request_txt", None),
+                   "side": "Buy" if getattr(row, "buy_sell", None) == "B" else "Sell",
+                   "symbol": getattr(offers.get(getattr(row, "offer_id", None)), "instrument", None),
+                   "entry": row.type in ENTRY_ORDER_TYPES,
+                   # Stop/limit orders attached to a pending entry order.
+                   "stop": attached_rate(getattr(row, "stop_order_id", None)),
+                   "limit": attached_rate(getattr(row, "limit_order_id", None))}
+                  for row in order_rows]
         return {"type": "account", "connection": "Demo", "server_time": timestamp(fx.session.server_time),
                 "accounts": [{"id": row.account_id, "name": row.account_name} for row in fx.get_table(ForexConnect.ACCOUNTS)],
                 "account": {"id": account.account_id, "currency": self.currency(fx),
@@ -219,6 +240,12 @@ class DemoTradingService:
         return next((row for row in fx.get_table(ForexConnect.TRADES)
                      if row.trade_id == trade_id and row.account_id == account_id), None)
 
+    def _order(self, fx, account_id, order_id):
+        if not order_id:
+            return None
+        return next((row for row in fx.get_table(ForexConnect.ORDERS)
+                     if row.order_id == order_id and row.account_id == account_id), None)
+
     def prepare(self, fx, command):
         account = self.account(fx, command["account_id"])
         if account.account_kind not in {"32", "36"} or account.margin_call_flag != "N":
@@ -226,11 +253,13 @@ class DemoTradingService:
         action = command["action"]
         offer = self.offer(fx, command["symbol"])
         instrument = self.instrument(fx, account, offer)
+        if action in {"open", "entry"} and self.journal.unresolved(account.account_id):
+            raise FXCMServiceError(409, "存在待确认指令，请先核对执行结果后再开仓")
+        if action in ENTRY_ACTIONS:
+            return self.prepare_entry(fx, command, account, offer, instrument)
         trade = None if action == "open" else self._trade(fx, account.account_id, command.get("trade_id"))
         if action != "open" and (trade is None or trade.offer_id != offer.offer_id):
             raise FXCMServiceError(409, "持仓已变化，请刷新账户后操作")
-        if action == "open" and self.journal.unresolved(account.account_id):
-            raise FXCMServiceError(409, "存在待确认指令，请先核对执行结果后再开仓")
         if action in {"open", "close"}:
             amount = command.get("amount")
             if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0 or amount % instrument["base_unit_size"]:
@@ -276,6 +305,94 @@ class DemoTradingService:
             command_type = fxcorepy.Constants.Commands.CREATE_ORDER
         return fx.create_order_request(order_type, command=command_type, **args), {}
 
+    def prepare_entry(self, fx, command, account, offer, instrument):
+        """Pending entry orders: create, move, cancel, and attach stop/limit.
+
+        Mirrors the official ForexConnect samples: ``Orders.ENTRY`` lets the
+        server choose LE/SE from the rate; attached stops/limits are separate
+        STOP/LIMIT orders bound with ``TRADE_ID`` = the entry row's trade_id.
+        """
+        action = command["action"]
+        if action == "entry":
+            amount = command.get("amount")
+            if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0 or amount % instrument["base_unit_size"]:
+                raise FXCMServiceError(400, "数量必须是该品种基础单位的正整数倍")
+            if amount < instrument["min_quantity"] or amount > instrument["max_quantity"]:
+                raise FXCMServiceError(400, "交易数量超出福汇允许范围")
+            if not instrument["can_open"]:
+                raise FXCMServiceError(409, "该账户不支持此品种的挂单")
+            if command.get("side") not in {"Buy", "Sell"}:
+                raise FXCMServiceError(400, "无效的交易方向")
+            side = "B" if command["side"] == "Buy" else "S"
+            rate = command.get("rate")
+            self.validate_rate(rate, offer, "挂单价")
+            args = dict(ACCOUNT_ID=account.account_id, OFFER_ID=offer.offer_id, BUY_SELL=side,
+                        AMOUNT=amount, RATE=rate, CUSTOM_ID=command["client_id"])
+            for key, param in [("stop", "RATE_STOP"), ("limit", "RATE_LIMIT")]:
+                if command.get(key) is not None:
+                    self.validate_entry_risk(command[key], key, side, rate, offer, instrument)
+                    args[param] = command[key]
+            return fx.create_order_request(fxcorepy.Constants.Orders.ENTRY, **args), {}
+
+        order = self._order(fx, account.account_id, command.get("order_id"))
+        if order is None or order.type not in ENTRY_ORDER_TYPES or order.offer_id != offer.offer_id:
+            raise FXCMServiceError(409, "挂单已成交、撤销或变化，请刷新账户后操作")
+        if action == "entry_cancel":
+            return fx.create_request({fxcorepy.O2GRequestParamsEnum.COMMAND: fxcorepy.Constants.Commands.DELETE_ORDER,
+                                      fxcorepy.O2GRequestParamsEnum.ACCOUNT_ID: account.account_id,
+                                      fxcorepy.O2GRequestParamsEnum.ORDER_ID: order.order_id}), {}
+        stop_row = self._order(fx, account.account_id, getattr(order, "stop_order_id", None))
+        limit_row = self._order(fx, account.account_id, getattr(order, "limit_order_id", None))
+        if action == "entry_edit":
+            rate = command.get("rate")
+            self.validate_rate(rate, offer, "挂单价")
+            market = offer.ask if order.buy_sell == "B" else offer.bid
+            wants_limit = rate < market if order.buy_sell == "B" else rate > market
+            if (order.type in LIMIT_ENTRY_TYPES and not wants_limit) or (order.type in STOP_ENTRY_TYPES and wants_limit):
+                raise FXCMServiceError(400, "新挂单价越过当前市价，挂单类型会在限价/止损之间改变；请撤销后重新挂单")
+            for kind, row in [("stop", stop_row), ("limit", limit_row)]:
+                if row is not None:
+                    self.validate_entry_risk(number(row, "rate"), kind, order.buy_sell, rate, offer, instrument)
+            return fx.create_order_request(order.type, command=fxcorepy.Constants.Commands.EDIT_ORDER,
+                ACCOUNT_ID=account.account_id, ORDER_ID=order.order_id, RATE=rate, AMOUNT=int(order.amount)), {}
+
+        kind, rate = command["kind"], command.get("rate")
+        attached = stop_row if kind == "stop" else limit_row
+        if rate is None:
+            if attached is None:
+                return None, {}
+            return fx.create_request({fxcorepy.O2GRequestParamsEnum.COMMAND: fxcorepy.Constants.Commands.DELETE_ORDER,
+                                      fxcorepy.O2GRequestParamsEnum.ACCOUNT_ID: account.account_id,
+                                      fxcorepy.O2GRequestParamsEnum.ORDER_ID: attached.order_id}), {}
+        self.validate_entry_risk(rate, kind, order.buy_sell, number(order, "rate"), offer, instrument)
+        order_type = fxcorepy.Constants.Orders.STOP if kind == "stop" else fxcorepy.Constants.Orders.LIMIT
+        if attached is not None:
+            return fx.create_order_request(order_type, command=fxcorepy.Constants.Commands.EDIT_ORDER,
+                ACCOUNT_ID=account.account_id, RATE=rate, ORDER_ID=attached.order_id), {}
+        return fx.create_order_request(order_type, command=fxcorepy.Constants.Commands.CREATE_ORDER,
+            ACCOUNT_ID=account.account_id, BUY_SELL="S" if order.buy_sell == "B" else "B",
+            OFFER_ID=offer.offer_id, RATE=rate, AMOUNT=int(order.amount), TRADE_ID=order.trade_id,
+            CUSTOM_ID=command["client_id"]), {}
+
+    @staticmethod
+    def validate_rate(rate, offer, label):
+        if isinstance(rate, bool) or not isinstance(rate, (int, float)) or not math.isfinite(rate) or rate <= 0:
+            raise FXCMServiceError(400, label + "必须为有效正数")
+        if abs(rate - round(rate, offer.digits)) > 1e-9:
+            raise FXCMServiceError(400, "价格精度超出该品种限制")
+
+    @staticmethod
+    def validate_entry_risk(rate, kind, side, entry_rate, offer, instrument):
+        """A pending order's stop/limit is measured from its own entry rate."""
+        if rate is None or isinstance(rate, bool) or not isinstance(rate, (int, float)) or not math.isfinite(rate) or rate <= 0:
+            raise FXCMServiceError(400, "止损/止盈价格必须为有效正数")
+        distance = instrument[("stop" if kind == "stop" else "limit") + "_distance_points"] * offer.point_size
+        direction = (1 if side == "B" else -1) * (1 if kind == "limit" else -1)
+        if (rate - entry_rate) * direction < max(distance, 10 ** -offer.digits) - 1e-10:
+            raise FXCMServiceError(400, "挂单的止损/止盈方向或最小距离不符合福汇规则")
+        if abs(rate - round(rate, offer.digits)) > 1e-9:
+            raise FXCMServiceError(400, "价格精度超出该品种限制")
+
     @staticmethod
     def validate_risk(rate, kind, side, offer, instrument):
         if not isinstance(rate, (int, float)) or not math.isfinite(rate) or rate <= 0:
@@ -288,8 +405,39 @@ class DemoTradingService:
         if abs(rate - round(rate, offer.digits)) > 1e-9:
             raise FXCMServiceError(400, "价格精度超出该品种限制")
 
+    def confirmed_entry(self, fx, command, result):
+        account_id, action = command["account_id"], command["action"]
+        if action == "entry":
+            for row in fx.get_table(ForexConnect.ORDERS):
+                if row.account_id == account_id and (getattr(row, "request_txt", None) == command["client_id"] or
+                   (result.get("order_id") and row.order_id == result["order_id"])):
+                    result["order_id"] = row.order_id
+                    return True
+            # A pending order can fill before the table is read.
+            for table in (ForexConnect.TRADES, ForexConnect.CLOSED_TRADES):
+                for row in fx.get_table(table):
+                    if row.account_id == account_id and (getattr(row, "open_order_request_txt", None) == command["client_id"] or
+                       (result.get("order_id") and row.open_order_id == result["order_id"])):
+                        result["trade_id"] = row.trade_id
+                        return True
+            return False
+        order = self._order(fx, account_id, command.get("order_id"))
+        if action == "entry_cancel":
+            return order is None
+        if order is None:
+            return False
+        target = command.get("rate")
+        if action == "entry_edit":
+            actual = number(order, "rate")
+        else:
+            attached = self._order(fx, account_id, getattr(order, "stop_order_id" if command["kind"] == "stop" else "limit_order_id", None))
+            actual = number(attached, "rate") if attached is not None else None
+        return actual == target or (actual is not None and target is not None and abs(actual - target) < 1e-9)
+
     def confirmed(self, fx, command, result):
         account_id = command["account_id"]
+        if command["action"] in ENTRY_ACTIONS:
+            return self.confirmed_entry(fx, command, result)
         if command["action"] == "open":
             for table, field in [(ForexConnect.TRADES, "open_order_request_txt"), (ForexConnect.CLOSED_TRADES, "open_order_request_txt")]:
                 for row in fx.get_table(table):
@@ -335,7 +483,7 @@ class DemoTradingService:
                 return self.result(command["client_id"])
             fx = self.service._ensure_connected()
             request, extra = self.prepare(fx, command)
-            if request is None and not (command["action"] == "risk" and command.get("rate") is None):
+            if request is None and not (command["action"] in {"risk", "entry_risk"} and command.get("rate") is None):
                 raise FXCMServiceError(400, "福汇无法创建此请求")
             created, result = self.journal.create(command)
             if not created:

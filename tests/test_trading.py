@@ -60,6 +60,89 @@ class TradingTests(unittest.TestCase):
         self.assertEqual((payload["BUY_SELL"], payload["AMOUNT"], payload["TRADE_ID"]), ("S", 1000, "trade"))
         with self.assertRaises(FXCMServiceError): self.service.prepare(self.fx, dict(self.command, action="close", trade_id="another-account-trade"))
 
+    def _with_orders(self, *orders):
+        self.fx.get_table = lambda table: ([self.account] if table == ForexConnect.ACCOUNTS
+                                           else [self.trade] if table == ForexConnect.TRADES
+                                           else list(orders) if table == ForexConnect.ORDERS else [])
+
+    def entry_row(self, **extra):
+        return Row(**{**dict(order_id="E1", trade_id="T-E1", account_id="demo", offer_id="1", type="LE",
+                             buy_sell="B", rate=1.09, amount=2000, stop_order_id="", limit_order_id=""), **extra})
+
+    def test_entry_order_uses_server_side_entry_type_and_validates_brackets_from_its_rate(self):
+        entry = dict(self.command, action="entry", rate=1.09)
+        self.service.prepare(self.fx, dict(entry, stop=1.085, limit=1.1))
+        order, payload = self.requests[-1]
+        self.assertEqual(order, fxcorepy.Constants.Orders.ENTRY)
+        self.assertEqual((payload["BUY_SELL"], payload["RATE"], payload["RATE_STOP"], payload["RATE_LIMIT"], payload["OFFER_ID"]),
+                         ("B", 1.09, 1.085, 1.1, "1"))
+        self.assertEqual(payload["CUSTOM_ID"], self.command["client_id"])
+        # Brackets are measured from the pending rate, not the current market.
+        for stop in [1.095, 1.09, 1.0850001]:
+            with self.assertRaises(FXCMServiceError): self.service.prepare(self.fx, dict(entry, stop=stop))
+        for rate in [0, -1, float("nan"), True, 1.090001]:
+            with self.assertRaises(FXCMServiceError): self.service.prepare(self.fx, dict(entry, rate=rate))
+        with self.assertRaises(FXCMServiceError): self.service.prepare(self.fx, dict(entry, amount=1500))
+
+    def test_entry_edit_cancel_and_brackets_target_the_pending_order(self):
+        stop = Row(order_id="S1", account_id="demo", offer_id="1", type="S", rate=1.08, buy_sell="S", amount=2000)
+        self._with_orders(self.entry_row(stop_order_id="S1"), stop)
+        base = dict(self.command, order_id="E1")
+        self.service.prepare(self.fx, dict(base, action="entry_edit", rate=1.095))
+        order, payload = self.requests[-1]
+        self.assertEqual((order, payload["ORDER_ID"], payload["RATE"], payload["AMOUNT"]), ("LE", "E1", 1.095, 2000))
+        # Crossing the market would turn a limit entry into a stop entry.
+        with self.assertRaises(FXCMServiceError): self.service.prepare(self.fx, dict(base, action="entry_edit", rate=1.2))
+        # The attached stop (1.08) must stay below the new buy rate.
+        with self.assertRaises(FXCMServiceError): self.service.prepare(self.fx, dict(base, action="entry_edit", rate=1.079))
+        self.service.prepare(self.fx, dict(base, action="entry_risk", kind="stop", rate=1.07))
+        order, payload = self.requests[-1]
+        self.assertEqual((order, payload["ORDER_ID"], payload["RATE"]), (fxcorepy.Constants.Orders.STOP, "S1", 1.07))
+        self.service.prepare(self.fx, dict(base, action="entry_risk", kind="limit", rate=1.1))
+        order, payload = self.requests[-1]
+        self.assertEqual((order, payload["TRADE_ID"], payload["BUY_SELL"], payload["AMOUNT"]),
+                         (fxcorepy.Constants.Orders.LIMIT, "T-E1", "S", 2000))
+        removed = self.service.prepare(self.fx, dict(base, action="entry_risk", kind="stop", rate=None))[0]
+        self.assertEqual(removed[fxcorepy.O2GRequestParamsEnum.ORDER_ID], "S1")
+        self.assertEqual(self.service.prepare(self.fx, dict(base, action="entry_risk", kind="limit", rate=None)), (None, {}))
+        cancel = self.service.prepare(self.fx, dict(base, action="entry_cancel"))[0]
+        self.assertEqual(cancel[fxcorepy.O2GRequestParamsEnum.COMMAND], fxcorepy.Constants.Commands.DELETE_ORDER)
+        self.assertEqual(cancel[fxcorepy.O2GRequestParamsEnum.ORDER_ID], "E1")
+        for missing in ["nope", "S1"]:  # unknown, or not an entry order
+            with self.assertRaises(FXCMServiceError):
+                self.service.prepare(self.fx, dict(base, action="entry_cancel", order_id=missing))
+
+    def test_entry_commands_confirm_from_the_orders_table(self):
+        entry_cmd = dict(self.command, action="entry", rate=1.09)
+        self._with_orders()
+        self.assertFalse(self.service.confirmed(self.fx, entry_cmd, {}))
+        self._with_orders(self.entry_row(request_txt=self.command["client_id"]))
+        result = {}
+        self.assertTrue(self.service.confirmed(self.fx, entry_cmd, result))
+        self.assertEqual(result["order_id"], "E1")
+        edit = dict(self.command, action="entry_edit", order_id="E1", rate=1.09)
+        self.assertTrue(self.service.confirmed(self.fx, edit, {}))
+        self.assertFalse(self.service.confirmed(self.fx, dict(edit, rate=1.08), {}))
+        cancel = dict(self.command, action="entry_cancel", order_id="E1")
+        self.assertFalse(self.service.confirmed(self.fx, cancel, {}))
+        self._with_orders()
+        self.assertTrue(self.service.confirmed(self.fx, cancel, {}))
+
+    def test_snapshot_lists_pending_orders_with_their_brackets(self):
+        stop = Row(order_id="S1", trade_id="T-E1", account_id="demo", offer_id="1", type="S", status="W", rate=1.08, buy_sell="S", amount=2000)
+        rows = [self.entry_row(stop_order_id="S1", status="W"), stop]
+        self.account.account_name = "Demo"
+        self.fx.get_table = lambda table: ([self.account] if table == ForexConnect.ACCOUNTS else [self.offer]
+                                           if table == ForexConnect.OFFERS else rows if table == ForexConnect.ORDERS else [])
+        self.fx.session = Row(server_time=None)
+        self.service.currency = lambda fx: "USD"
+        with patch("app.services.trading.require_demo_trading"):
+            orders = self.service.snapshot("EUR/USD")["orders"]
+        entry = next(order for order in orders if order["order_id"] == "E1")
+        self.assertEqual((entry["entry"], entry["side"], entry["symbol"], entry["stop"], entry["limit"]),
+                         (True, "Buy", "EUR/USD", 1.08, None))
+        self.assertFalse(next(order for order in orders if order["order_id"] == "S1")["entry"])
+
     def test_durable_idempotency_and_conflicting_payload(self):
         sent = []
         self.fx.send_request = lambda request: sent.append(request) or Row(order_id="order")

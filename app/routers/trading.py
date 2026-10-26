@@ -30,10 +30,11 @@ class Command(BaseModel):
     client_id: UUID
     account_id: constr(min_length=1, max_length=64)
     symbol: constr(min_length=1, max_length=64)
-    action: Literal["open", "close", "risk"]
+    action: Literal["open", "close", "risk", "entry", "entry_edit", "entry_cancel", "entry_risk"]
     side: Optional[Literal["Buy", "Sell"]] = None
     amount: Optional[StrictInt] = None
     trade_id: Optional[constr(min_length=1, max_length=64)] = None
+    order_id: Optional[constr(min_length=1, max_length=64)] = None
     stop: Optional[float] = None
     limit: Optional[float] = None
     kind: Optional[Literal["stop", "limit"]] = None
@@ -62,8 +63,12 @@ def state(symbol: str = Query(..., min_length=1, max_length=64), account_id: Opt
 
 @router.post("/commands")
 def execute(command: Command):
-    if command.action == "risk" and not command.kind:
+    if command.action in {"risk", "entry_risk"} and not command.kind:
         raise HTTPException(400, "缺少止损/止盈类型")
+    if command.action in {"entry_edit", "entry_cancel", "entry_risk"} and not command.order_id:
+        raise HTTPException(400, "缺少挂单编号")
+    if command.action in {"entry", "entry_edit"} and command.rate is None:
+        raise HTTPException(400, "缺少挂单价")
     payload = command.dict()
     payload["client_id"] = str(command.client_id)
     return demo_trading.execute(payload)
