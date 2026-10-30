@@ -222,7 +222,7 @@ class TradingTests(unittest.TestCase):
         with patch("app.services.trading.require_demo_trading"), patch(
             "app.services.trading.Common.refresh_table_by_account", return_value=closed
         ) as refresh:
-            result = self.service.history("demo", 1792195200, 1792281600)
+            result = self.service.history("demo", 1792195200, 1792281600, scope="recent")
 
         refresh.assert_called_once_with(self.fx, ForexConnect.CLOSED_TRADES, "demo")
         self.assertEqual([item["trade_id"] for item in result["items"]], ["new"])

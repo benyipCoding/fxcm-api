@@ -14,6 +14,7 @@ from forexconnect.common import Common
 
 from app.services.fxcm_service import FXCMServiceError, fxcm_history_service
 from app.services.realtime import realtime_enabled
+from app.services.trade_reports import fetch_statement
 
 
 # Pending (entry) order types in the ORDERS table. Limit entries wait for a
@@ -194,31 +195,31 @@ class DemoTradingService:
                 "closed_positions": closed, "orders": orders,
                 "unresolved": self.journal.unresolved(account.account_id)}
 
-    def history(self, account_id=None, from_ts=None, to_ts=None):
-        """Refresh and return the broker's closed-trade history for an account.
-
-        ``CLOSED_TRADES`` is an FXCM account table rather than application
-        history. Refreshing it through ForexConnect makes this endpoint read
-        the broker's current records directly and keeps the local command
-        journal out of the displayed trade history.
-        """
+    def history(self, account_id=None, from_ts=None, to_ts=None, scope="all"):
+        """Use CAS for full history; CLOSED_TRADES only supplies recent rows."""
         require_demo_trading()
         fx = self.service._ensure_connected()
         account = self.account(fx, account_id)
-        offers = {row.offer_id: row for row in fx.get_table(ForexConnect.OFFERS)}
+        currency = self.currency(fx)
         try:
-            reader = Common.refresh_table_by_account(
-                fx, ForexConnect.CLOSED_TRADES, account.account_id
-            )
-            rows = list(reader)
+            if scope == "recent":
+                offers = {row.offer_id: row for row in fx.get_table(ForexConnect.OFFERS)}
+                reader = Common.refresh_table_by_account(fx, ForexConnect.CLOSED_TRADES, account.account_id)
+                rows = [self.position(row, offers, closed=True) for row in reader
+                        if getattr(row, "account_id", None) == account.account_id]
+            else:
+                rows, report_currency = fetch_statement(
+                    fx, account.account_id, from_ts, to_ts,
+                    account_name=getattr(account, "account_name", None),
+                )
+                currency = report_currency or currency
         except Exception as exc:
-            raise FXCMServiceError(502, f"查询福汇交易记录失败：{exc}") from exc
+            # Never silently substitute today's table for a failed full report,
+            # or expose its signed URL in an HTTP error message.
+            raise FXCMServiceError(502, "查询福汇交易记录失败，请稍后重试") from exc
 
         items = []
-        for row in rows:
-            if getattr(row, "account_id", None) != account.account_id:
-                continue
-            item = self.position(row, offers, closed=True)
+        for item in rows:
             close_ts = item.get("close_time")
             if from_ts is not None and (close_ts is None or close_ts < from_ts):
                 continue
@@ -229,7 +230,7 @@ class DemoTradingService:
         items.sort(key=lambda item: item.get("close_time") or 0, reverse=True)
         return {
             "type": "history",
-            "account": {"id": account.account_id, "currency": self.currency(fx)},
+            "account": {"id": account.account_id, "currency": currency},
             "server_time": timestamp(fx.session.server_time),
             "from": from_ts,
             "to": to_ts,
