@@ -80,7 +80,7 @@ class TradeReportTests(unittest.TestCase):
             trade(), trade(ticket_id="today", close_date="2026-10-30 02:13:09"),
         ]), "demo")
         with patch("app.services.trading.require_demo_trading"), \
-                patch("app.services.trading.fetch_statement", return_value=(rows, "USD")), \
+                patch("app.services.trading.statement_client.fetch", return_value=(rows, "USD")), \
                 patch("app.services.trading.Common.refresh_table_by_account") as recent:
             result = service.history("demo")
             self.assertEqual([r["trade_id"] for r in result["items"]], ["today", "old"])
@@ -94,7 +94,7 @@ class TradeReportTests(unittest.TestCase):
         fx = Row(get_table=lambda table: [Row(account_id="demo")])
         service = DemoTradingService(Row(_ensure_connected=lambda: fx))
         with patch("app.services.trading.require_demo_trading"), \
-                patch("app.services.trading.fetch_statement", side_effect=ValueError("https://broker/?token=private")), \
+                patch("app.services.trading.statement_client.fetch", side_effect=ValueError("https://broker/?token=private")), \
                 patch("app.services.trading.Common.refresh_table_by_account") as recent:
             with self.assertRaises(FXCMServiceError) as error: service.history("demo")
         self.assertNotIn("private", error.exception.message)

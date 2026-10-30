@@ -14,7 +14,7 @@ from forexconnect.common import Common
 
 from app.services.fxcm_service import FXCMServiceError, fxcm_history_service
 from app.services.realtime import realtime_enabled
-from app.services.trade_reports import fetch_statement
+from app.services.trade_report_client import statement_client
 
 
 # Pending (entry) order types in the ORDERS table. Limit entries wait for a
@@ -208,11 +208,13 @@ class DemoTradingService:
                 rows = [self.position(row, offers, closed=True) for row in reader
                         if getattr(row, "account_id", None) == account.account_id]
             else:
-                rows, report_currency = fetch_statement(
-                    fx, account.account_id, from_ts, to_ts,
+                rows, report_currency = statement_client.fetch(
+                    account.account_id, from_ts, to_ts,
                     account_name=getattr(account, "account_name", None),
                 )
                 currency = report_currency or currency
+        except FXCMServiceError:
+            raise
         except Exception as exc:
             # Never silently substitute today's table for a failed full report,
             # or expose its signed URL in an HTTP error message.

@@ -1,7 +1,12 @@
 """Read ForexConnect Combined Account Statement XML, including archived trades."""
 import math
+import logging
+import socket
+from time import monotonic
 from datetime import datetime, timedelta
-from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+from urllib.request import getproxies, proxy_bypass, urlopen
 from xml.etree import ElementTree as ET
 
 import pytz
@@ -9,6 +14,28 @@ import pytz
 
 NS = {"r": "http://re.fxcm.com/2008/2.0/format-xml"}
 REPORT_TIMEZONE = pytz.timezone("America/New_York")
+logger = logging.getLogger(__name__)
+
+
+class StatementError(Exception):
+    """Safe report diagnostics: never include a signed URL or raw SDK error."""
+    def __init__(self, stage, cause, elapsed, using_proxy=False):
+        reason = cause.reason if isinstance(cause, URLError) else cause
+        token_timeout = stage == "url" and str(cause) == "Token not received"
+        self.timed_out = token_timeout or isinstance(reason, (socket.timeout, TimeoutError))
+        self.details = {
+            "stage": stage, "error_type": type(cause).__name__,
+            "reason_type": type(reason).__name__,
+            "http_status": cause.code if isinstance(cause, HTTPError) else None,
+            "elapsed_seconds": round(elapsed, 2), "using_proxy": using_proxy,
+            "reason_code": "report_token_timeout" if token_timeout else None,
+        }
+        self.message = {
+            "url": "福汇历史报表授权超时，请重试" if token_timeout else "获取福汇历史报表链接失败，请重试",
+            "download": "福汇历史报表下载超时，请重试" if self.timed_out else "福汇历史报表下载失败，请重试",
+            "parse": "福汇历史报表格式或账户校验失败，请重试",
+        }[stage]
+        super().__init__(self.message)
 
 
 def report_number(value):
@@ -77,11 +104,22 @@ def fetch_statement(fx, account_id, from_ts=None, to_ts=None, account_name=None)
     # the caller applies the exact UTC [from, to) filter after parsing.
     start = datetime(1990, 1, 1) if from_ts is None else datetime.utcfromtimestamp(from_ts) - timedelta(days=1)
     end = (datetime.utcnow() if to_ts is None else datetime.utcfromtimestamp(to_ts)) + timedelta(days=1)
-    url = fx.session.get_report_url(account_id, start, end, "xml", "enu")
-    if not url:
-        raise ValueError("No FXCM statement URL")
-    # The URL includes a short-lived token. Do not log or return it to clients.
-    with urlopen(url, timeout=45) as response:
+    stage, using_proxy, started = "url", False, monotonic()
+    try:
+        url = fx.session.get_report_url(account_id, start, end, "xml", "enu")
+        if not url:
+            raise ValueError("No FXCM statement URL")
+        stage, started = "download", monotonic()
+        target = urlsplit(url)
+        using_proxy = bool(getproxies().get(target.scheme)) and not proxy_bypass(target.hostname)
+        # The URL includes a short-lived token. Do not log or return it to clients.
+        with urlopen(url, timeout=45) as response:
+            content = response.read()
+        stage, started = "parse", monotonic()
         # CAS identifies the account by its visible account number/name, while
         # get_report_url takes ForexConnect's distinct internal account ID.
-        return parse_statement(response.read(), account_name or account_id)
+        return parse_statement(content, account_name or account_id)
+    except Exception as exc:
+        error = StatementError(stage, exc, monotonic() - started, using_proxy)
+        logger.warning("FXCM statement failed: %s", error.details)
+        raise error from exc
